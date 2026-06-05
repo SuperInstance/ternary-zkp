@@ -1,537 +1,621 @@
-//! Zero-knowledge proofs over ternary fields.
+//! Zero-knowledge proofs over the ternary field GF(3).
 //!
-//! # Structures
-//! - `GF3`: prime field GF(3), elements {0,1,2}
-//! - `GF3n`: extension field GF(3^n) via polynomial representation
-//! - `TernaryPoly`: polynomials with GF(3) coefficients
-//! - `Commitment`: hash-based hiding commitment to a GF(3) element
-//! - `ZKProof`: prove knowledge of committed value; prove committed value = 1 (+1)
-//!
-//! "Ternary value +1" is represented as the GF(3) element 1 (balanced: -1→2, 0→0, +1→1).
+//! - [`TernaryField`]        GF(3) arithmetic; elements {0,1,2}, where 2 ≡ −1
+//! - [`GF3Polynomial`]       dense polynomials over GF(3)
+//! - [`PolynomialCommitment`] SRS-based commit: C(f) = g^{f(τ)} mod p
+//! - [`ZKProof`]             CDS94 OR-proof that a Pedersen commitment hides
+//!                           some x ∈ {0,1,2} without revealing which
+//! - [`ZKVerifier`]          verifies ZKProof transcripts
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+// ─── modular arithmetic ───────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// GF(3) — prime field
-// ---------------------------------------------------------------------------
+/// Fast modular exponentiation.
+pub fn modpow(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
+    if modulus == 1 {
+        return 0;
+    }
+    let mut result = 1u64;
+    base %= modulus;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result * base % modulus;
+        }
+        exp >>= 1;
+        base = base * base % modulus;
+    }
+    result
+}
 
+/// Modular inverse via Fermat's little theorem (prime modulus required).
+pub fn modinv(a: u64, p: u64) -> u64 {
+    modpow(a, p - 2, p)
+}
+
+/// Fiat-Shamir challenge hash — deterministic, domain-separated LCG mix.
+pub fn challenge_hash(values: &[u64]) -> u64 {
+    let mut h: u64 = 0xdead_beef_cafe_babe;
+    for &v in values {
+        h = h
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(v.wrapping_add(1))
+            .wrapping_add(1_442_695_040_888_963_407);
+    }
+    // 20-bit result in [1, 2^20]
+    (h >> 8) % (1 << 20) + 1
+}
+
+fn prng(seed: u64) -> u64 {
+    seed.wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407)
+}
+
+const P: u64 = 1_000_000_007; // prime modulus
+const G: u64 = 2; // generator for commitment scheme
+const H: u64 = 3; // independent second generator for Pedersen
+const CHAL_MOD: u64 = 1 << 20; // challenge space
+
+// ─── TernaryField ─────────────────────────────────────────────────────────────
+
+/// An element of GF(3): stored as 0, 1, or 2 (where 2 ≡ −1 mod 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GF3(pub u8); // 0, 1, or 2
+pub struct TernaryField(pub u8);
 
-impl GF3 {
-    pub const ZERO: GF3 = GF3(0);
-    pub const ONE: GF3 = GF3(1);
-    pub const TWO: GF3 = GF3(2);
+impl TernaryField {
+    pub const ZERO: Self = Self(0);
+    pub const ONE: Self = Self(1);
+    pub const NEG_ONE: Self = Self(2); // −1 ≡ 2 mod 3
 
+    /// Construct from any integer, canonically reducing mod 3.
     pub fn new(v: i64) -> Self {
-        GF3(((v % 3 + 3) % 3) as u8)
+        Self(((v % 3 + 3) % 3) as u8)
     }
 
-    pub fn add(self, rhs: GF3) -> GF3 { GF3((self.0 + rhs.0) % 3) }
-    pub fn sub(self, rhs: GF3) -> GF3 { GF3((self.0 + 3 - rhs.0) % 3) }
-    pub fn mul(self, rhs: GF3) -> GF3 { GF3((self.0 * rhs.0) % 3) }
-    pub fn neg(self) -> GF3 { GF3((3 - self.0) % 3) }
+    pub fn add(self, rhs: Self) -> Self {
+        Self((self.0 + rhs.0) % 3)
+    }
+    pub fn sub(self, rhs: Self) -> Self {
+        Self((self.0 + 3 - rhs.0) % 3)
+    }
+    pub fn mul(self, rhs: Self) -> Self {
+        Self(self.0 * rhs.0 % 3)
+    }
+    pub fn neg(self) -> Self {
+        Self((3 - self.0) % 3)
+    }
 
-    pub fn inv(self) -> Option<GF3> {
+    /// Multiplicative inverse; `None` for zero (not invertible).
+    pub fn inv(self) -> Option<Self> {
         match self.0 {
             0 => None,
-            1 => Some(GF3(1)),
-            2 => Some(GF3(2)), // 2*2=4≡1 mod 3
+            1 => Some(Self(1)),
+            2 => Some(Self(2)), // 2 × 2 = 4 ≡ 1 mod 3
             _ => unreachable!(),
         }
     }
 
-    pub fn pow(self, mut exp: u32) -> GF3 {
-        let mut base = self;
-        let mut result = GF3::ONE;
-        while exp > 0 {
-            if exp & 1 == 1 { result = result.mul(base); }
-            base = base.mul(base);
-            exp >>= 1;
+    pub fn pow(self, exp: u32) -> Self {
+        let mut result = Self::ONE;
+        for _ in 0..exp {
+            result = result.mul(self);
         }
         result
     }
 
-    /// Convert balanced trit (-1,0,+1) to GF3 element (2,0,1)
-    pub fn from_trit(t: i8) -> Self {
-        match t {
-            -1 => GF3(2),
-             0 => GF3(0),
-             1 => GF3(1),
-            _ => panic!("invalid trit"),
-        }
+    pub fn is_zero(self) -> bool {
+        self.0 == 0
     }
 
-    /// Convert GF3 element back to balanced trit
-    pub fn to_trit(self) -> i8 {
+    /// Signed integer view: 0 → 0, 1 → +1, 2 → −1.
+    pub fn to_i8(self) -> i8 {
         match self.0 {
             0 => 0,
             1 => 1,
-            2 => -1,
-            _ => unreachable!(),
+            _ => -1,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// TernaryPoly — polynomial over GF(3), coefficients low-degree first
-// ---------------------------------------------------------------------------
+// ─── GF3Polynomial ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TernaryPoly {
-    pub coeffs: Vec<GF3>, // coeffs[i] = coefficient of x^i
+/// Dense polynomial over GF(3).  `coeffs[i]` is the coefficient of xⁱ.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GF3Polynomial {
+    pub coeffs: Vec<TernaryField>,
 }
 
-impl TernaryPoly {
-    pub fn zero() -> Self { TernaryPoly { coeffs: vec![] } }
-
-    pub fn constant(c: GF3) -> Self { TernaryPoly { coeffs: vec![c] } }
-
-    pub fn new(coeffs: Vec<GF3>) -> Self {
-        let mut p = TernaryPoly { coeffs };
+impl GF3Polynomial {
+    pub fn new(coeffs: Vec<TernaryField>) -> Self {
+        let mut p = Self { coeffs };
         p.trim();
         p
     }
 
+    pub fn zero() -> Self {
+        Self { coeffs: vec![] }
+    }
+
+    pub fn constant(c: TernaryField) -> Self {
+        if c.is_zero() {
+            Self::zero()
+        } else {
+            Self::new(vec![c])
+        }
+    }
+
     fn trim(&mut self) {
-        while self.coeffs.last() == Some(&GF3::ZERO) {
+        while self.coeffs.last() == Some(&TernaryField::ZERO) {
             self.coeffs.pop();
         }
     }
 
+    pub fn is_zero(&self) -> bool {
+        self.coeffs.is_empty()
+    }
+
     pub fn degree(&self) -> Option<usize> {
-        if self.coeffs.is_empty() { None } else { Some(self.coeffs.len() - 1) }
+        if self.coeffs.is_empty() {
+            None
+        } else {
+            Some(self.coeffs.len() - 1)
+        }
     }
 
-    pub fn get(&self, i: usize) -> GF3 {
-        self.coeffs.get(i).copied().unwrap_or(GF3::ZERO)
+    fn coeff(&self, i: usize) -> TernaryField {
+        self.coeffs.get(i).copied().unwrap_or(TernaryField::ZERO)
     }
 
-    pub fn add(&self, rhs: &TernaryPoly) -> TernaryPoly {
-        let len = self.coeffs.len().max(rhs.coeffs.len());
-        let coeffs = (0..len).map(|i| self.get(i).add(rhs.get(i))).collect();
-        TernaryPoly::new(coeffs)
+    pub fn evaluate(&self, x: TernaryField) -> TernaryField {
+        let mut result = TernaryField::ZERO;
+        let mut power = TernaryField::ONE;
+        for &c in &self.coeffs {
+            result = result.add(c.mul(power));
+            power = power.mul(x);
+        }
+        result
     }
 
-    pub fn sub(&self, rhs: &TernaryPoly) -> TernaryPoly {
-        let len = self.coeffs.len().max(rhs.coeffs.len());
-        let coeffs = (0..len).map(|i| self.get(i).sub(rhs.get(i))).collect();
-        TernaryPoly::new(coeffs)
+    pub fn add(&self, rhs: &Self) -> Self {
+        let n = self.coeffs.len().max(rhs.coeffs.len());
+        Self::new((0..n).map(|i| self.coeff(i).add(rhs.coeff(i))).collect())
     }
 
-    pub fn mul(&self, rhs: &TernaryPoly) -> TernaryPoly {
-        if self.coeffs.is_empty() || rhs.coeffs.is_empty() {
-            return TernaryPoly::zero();
+    pub fn sub(&self, rhs: &Self) -> Self {
+        let n = self.coeffs.len().max(rhs.coeffs.len());
+        Self::new((0..n).map(|i| self.coeff(i).sub(rhs.coeff(i))).collect())
+    }
+
+    pub fn mul(&self, rhs: &Self) -> Self {
+        if self.is_zero() || rhs.is_zero() {
+            return Self::zero();
         }
         let n = self.coeffs.len() + rhs.coeffs.len() - 1;
-        let mut coeffs = vec![GF3::ZERO; n];
+        let mut coeffs = vec![TernaryField::ZERO; n];
         for (i, &a) in self.coeffs.iter().enumerate() {
             for (j, &b) in rhs.coeffs.iter().enumerate() {
                 coeffs[i + j] = coeffs[i + j].add(a.mul(b));
             }
         }
-        TernaryPoly::new(coeffs)
+        Self::new(coeffs)
     }
 
-    /// Evaluate polynomial at x in GF(3)
-    pub fn eval(&self, x: GF3) -> GF3 {
-        let mut acc = GF3::ZERO;
-        let mut xpow = GF3::ONE;
-        for &c in &self.coeffs {
-            acc = acc.add(c.mul(xpow));
-            xpow = xpow.mul(x);
-        }
-        acc
+    pub fn scale(&self, s: TernaryField) -> Self {
+        Self::new(self.coeffs.iter().map(|&c| c.mul(s)).collect())
     }
 
-    /// Reduce modulo another polynomial (for GF(3^n) construction)
-    pub fn rem(&self, modulus: &TernaryPoly) -> TernaryPoly {
-        let mut r = self.clone();
-        let d = match modulus.degree() {
-            Some(d) => d,
-            None => panic!("modulus is zero"),
-        };
-        let lead_inv = modulus.coeffs[d].inv().expect("modulus leading coeff must be nonzero");
-        loop {
-            r.trim();
-            let rd = match r.degree() {
-                Some(rd) if rd >= d => rd,
-                _ => break,
-            };
-            let factor = r.coeffs[rd].mul(lead_inv);
-            let shift = rd - d;
-            for i in 0..=d {
-                let j = i + shift;
-                let sub = factor.mul(modulus.get(i));
-                r.coeffs[j] = r.coeffs[j].sub(sub);
-            }
-        }
-        r.trim();
-        r
+    /// x³ − x: vanishes on every element of GF(3) (Fermat's little theorem).
+    pub fn ternary_membership_poly() -> Self {
+        // coeffs [0, 2, 0, 1] → 2x + x³ (and 2 ≡ −1, so this is x³ − x)
+        Self::new(vec![
+            TernaryField::ZERO,
+            TernaryField::NEG_ONE,
+            TernaryField::ZERO,
+            TernaryField::ONE,
+        ])
     }
 }
 
-// ---------------------------------------------------------------------------
-// GF(3^n) — extension field via irreducible polynomial
-// ---------------------------------------------------------------------------
+// ─── PolynomialCommitment ─────────────────────────────────────────────────────
 
-/// GF(3^2) using modulus x^2 + 1 (irreducible over GF(3))
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GF3n {
-    pub poly: TernaryPoly,
-    pub modulus: TernaryPoly,
-    pub n: usize,
-}
-
-impl GF3n {
-    /// Modulus for GF(3^2): x^2 + 1
-    pub fn gf9_modulus() -> TernaryPoly {
-        TernaryPoly::new(vec![GF3(1), GF3(0), GF3(1)]) // 1 + x^2
-    }
-
-    pub fn new(poly: TernaryPoly, modulus: TernaryPoly, n: usize) -> Self {
-        let poly = poly.rem(&modulus);
-        GF3n { poly, modulus, n }
-    }
-
-    pub fn from_gf3(v: GF3, modulus: TernaryPoly, n: usize) -> Self {
-        GF3n::new(TernaryPoly::constant(v), modulus, n)
-    }
-
-    pub fn add(&self, rhs: &GF3n) -> GF3n {
-        let p = self.poly.add(&rhs.poly);
-        GF3n::new(p, self.modulus.clone(), self.n)
-    }
-
-    pub fn mul(&self, rhs: &GF3n) -> GF3n {
-        let p = self.poly.mul(&rhs.poly);
-        GF3n::new(p, self.modulus.clone(), self.n)
-    }
-
-    pub fn zero(modulus: TernaryPoly, n: usize) -> Self {
-        GF3n { poly: TernaryPoly::zero(), modulus, n }
-    }
-
-    pub fn one(modulus: TernaryPoly, n: usize) -> Self {
-        GF3n::new(TernaryPoly::constant(GF3::ONE), modulus, n)
-    }
-
-    pub fn is_zero(&self) -> bool { self.poly.coeffs.is_empty() }
-}
-
-// ---------------------------------------------------------------------------
-// Hash-based commitment scheme
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commitment {
-    pub hash: u64,
-}
-
-impl Commitment {
-    /// commit(value, nonce): binding + computationally hiding
-    pub fn commit(value: GF3, nonce: u64) -> Self {
-        let mut h = DefaultHasher::new();
-        value.0.hash(&mut h);
-        nonce.hash(&mut h);
-        Commitment { hash: h.finish() }
-    }
-
-    /// Verify that a claimed (value, nonce) opens this commitment
-    pub fn verify_opening(&self, value: GF3, nonce: u64) -> bool {
-        let c = Commitment::commit(value, nonce);
-        c.hash == self.hash
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Polynomial commitment: commit to each coefficient separately
-// ---------------------------------------------------------------------------
-
+/// KZG-style SRS commitment to a polynomial over GF(3).
+///
+/// Setup chooses a secret τ; `srs[i] = G^{τⁱ} mod P`.
+/// `commit(f) = ∏ srs[i]^{fᵢ} = G^{f(τ)} mod P`.
 #[derive(Debug, Clone)]
-pub struct PolyCommitment {
-    pub coeff_commitments: Vec<Commitment>,
-    pub nonces: Vec<u64>,
+pub struct PolynomialCommitment {
+    pub srs: Vec<u64>,
 }
 
-impl PolyCommitment {
-    pub fn commit(poly: &TernaryPoly, nonces: Vec<u64>) -> Self {
-        let coeff_commitments = poly.coeffs.iter().zip(nonces.iter())
-            .map(|(&c, &n)| Commitment::commit(c, n))
-            .collect();
-        PolyCommitment { coeff_commitments, nonces }
+impl PolynomialCommitment {
+    pub fn setup(tau: u64, max_degree: usize) -> Self {
+        let ord = P - 1;
+        let mut srs = vec![1u64; max_degree + 1];
+        let mut exp = 1u64;
+        for s in srs.iter_mut() {
+            *s = modpow(G, exp, P);
+            exp = exp * tau % ord;
+        }
+        Self { srs }
     }
 
-    /// Reveal evaluation at point x by opening all coefficients
-    pub fn open_eval(&self, poly: &TernaryPoly, x: GF3) -> EvalProof {
-        let claimed = poly.eval(x);
-        EvalProof {
-            x,
-            claimed_value: claimed,
-            poly_coeffs: poly.coeffs.clone(),
-            nonces: self.nonces.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EvalProof {
-    pub x: GF3,
-    pub claimed_value: GF3,
-    pub poly_coeffs: Vec<GF3>,
-    pub nonces: Vec<u64>,
-}
-
-impl EvalProof {
-    /// Verify the evaluation proof against a polynomial commitment
-    pub fn verify(&self, commitment: &PolyCommitment) -> bool {
-        // Check each coefficient commitment opens correctly
-        if self.poly_coeffs.len() != commitment.coeff_commitments.len() {
-            return false;
-        }
-        for (i, (&c, cm)) in self.poly_coeffs.iter().zip(commitment.coeff_commitments.iter()).enumerate() {
-            if !cm.verify_opening(c, self.nonces[i]) {
-                return false;
+    pub fn commit(&self, poly: &GF3Polynomial) -> u64 {
+        let mut c = 1u64;
+        for (i, &coeff) in poly.coeffs.iter().enumerate() {
+            if i >= self.srs.len() {
+                break;
             }
+            c = c * modpow(self.srs[i], coeff.0 as u64, P) % P;
         }
-        // Check that evaluation is correct
-        let poly = TernaryPoly::new(self.poly_coeffs.clone());
-        poly.eval(self.x) == self.claimed_value
+        c
+    }
+
+    pub fn verify(&self, poly: &GF3Polynomial, commitment: u64) -> bool {
+        self.commit(poly) == commitment
     }
 }
 
-// ---------------------------------------------------------------------------
-// ZKProof: prove a committed GF3 element = 1 (balanced: +1) without revealing nonce
-//
-// Protocol (non-interactive via Fiat-Shamir):
-//   Prover holds (v=1, r_nonce). Commits: C = commit(1, r_nonce).
-//   To prove v=1: creates auxiliary commitment A = commit(1, r2),
-//   derives challenge e = hash(C, A), reveals z = r_nonce XOR (e & r2).
-//
-// Here we use a simpler membership proof: prove v ∈ {0,1,2} (trivial) and
-// a "specific value" proof with a non-interactive witness protocol.
-// ---------------------------------------------------------------------------
+// ─── ZKProof ──────────────────────────────────────────────────────────────────
 
+/// Parameters for a Pedersen commitment C = g^x · h^r mod p.
+#[derive(Debug, Clone)]
+pub struct PedersenParams {
+    pub g: u64,
+    pub h: u64,
+    pub p: u64,
+}
+
+impl Default for PedersenParams {
+    fn default() -> Self {
+        Self { g: G, h: H, p: P }
+    }
+}
+
+impl PedersenParams {
+    pub fn commit(&self, x: u64, r: u64) -> u64 {
+        modpow(self.g, x, self.p) * modpow(self.h, r, self.p) % self.p
+    }
+}
+
+/// Non-interactive OR-composition Schnorr proof (Fiat-Shamir heuristic).
+///
+/// Proves that Pedersen commitment C = g^x · h^r hides some x ∈ {0,1,2}
+/// (i.e., x is a valid GF(3) / ternary value) without revealing which.
+///
+/// For each branch v ∈ {0,1,2}, define T_v = C · g^{−v}.
+/// If x = v then T_v = h^r.  The proof demonstrates ∃ v: DL_h(T_v) = r.
+///
+/// False branches are simulated: pick (e_v, s_v), set A_v = h^{s_v} · T_v^{−e_v}.
+/// Real branch: A_x = h^k, then after Fiat-Shamir c_x = c − Σe_v, s_x = k + c_x·r.
 #[derive(Debug, Clone)]
 pub struct ZKProof {
-    pub commitment: Commitment,
-    /// Auxiliary commitment for the sigma protocol
-    pub aux_commitment: Commitment,
-    /// Challenge derived via Fiat-Shamir
-    pub challenge: u64,
-    /// Response: nonce masked by challenge
-    pub response: u64,
-    /// Claimed value (the specific trit being proved)
-    pub claimed_value: GF3,
+    pub commitment: u64,
+    pub announcements: [u64; 3],
+    pub challenges: [u64; 3],
+    pub responses: [u64; 3],
 }
 
 impl ZKProof {
-    /// Prove that commitment commits to `value` (GF3(1) for +1)
-    /// Uses a simple sigma-protocol style non-interactive proof.
-    pub fn prove(value: GF3, nonce: u64, aux_nonce: u64) -> (Commitment, ZKProof) {
-        let commitment = Commitment::commit(value, nonce);
-        let aux_commitment = Commitment::commit(value, aux_nonce);
+    /// Prove that `x ∈ {0,1,2}` is committed in C = g^x · h^r.
+    ///
+    /// `nonce` is deterministic randomness; use fresh secure entropy in production.
+    pub fn prove(params: &PedersenParams, x: u64, r: u64, nonce: u64) -> Self {
+        assert!(x < 3, "x must be in {{0,1,2}}");
+        let (p, h, ord) = (params.p, params.h, params.p - 1);
+        let commitment = params.commit(x, r);
 
-        let challenge = {
-            let mut h = DefaultHasher::new();
-            commitment.hash.hash(&mut h);
-            aux_commitment.hash.hash(&mut h);
-            h.finish()
+        // T_v = C · g^{−v} mod p
+        let tv = |v: u64| -> u64 {
+            let g_neg_v = if v == 0 {
+                1u64
+            } else {
+                modpow(params.g, ord - v, p)
+            };
+            commitment * g_neg_v % p
         };
 
-        let response = nonce ^ (challenge.wrapping_mul(aux_nonce));
+        let mut announcements = [0u64; 3];
+        let mut challenges = [0u64; 3];
+        let mut responses = [0u64; 3];
 
-        let proof = ZKProof {
-            commitment: commitment.clone(),
-            aux_commitment,
-            challenge,
-            response,
-            claimed_value: value,
-        };
-
-        (commitment, proof)
-    }
-
-    /// Verify the proof: commitment opens to claimed_value under some nonce
-    /// consistent with the sigma protocol.
-    pub fn verify(&self) -> bool {
-        // Recompute challenge from commitments (Fiat-Shamir)
-        let expected_challenge = {
-            let mut h = DefaultHasher::new();
-            self.commitment.hash.hash(&mut h);
-            self.aux_commitment.hash.hash(&mut h);
-            h.finish()
-        };
-        self.challenge == expected_challenge
-    }
-
-    /// Prove that a committed value is specifically +1 (GF3(1) in balanced convention)
-    pub fn prove_is_plus_one(value: GF3, nonce: u64) -> Option<(Commitment, ZKProof)> {
-        if value != GF3::ONE {
-            return None; // can only prove if value actually is +1
+        // Simulate false branches
+        let mut seed = prng(nonce.wrapping_add(0xcafe));
+        for v in 0..3u64 {
+            if v == x {
+                continue;
+            }
+            let e_v = prng(seed) % CHAL_MOD + 1;
+            seed = prng(seed);
+            let s_v = prng(seed) % ord + 1;
+            seed = prng(seed);
+            challenges[v as usize] = e_v;
+            responses[v as usize] = s_v;
+            // A_v = h^{s_v} · T_v^{−e_v}
+            announcements[v as usize] =
+                modpow(h, s_v, p) * modpow(modinv(tv(v), p), e_v, p) % p;
         }
-        let aux_nonce = nonce.wrapping_mul(0xdeadbeefcafe1337);
-        Some(ZKProof::prove(value, nonce, aux_nonce))
-    }
 
-    /// Verify that commitment proves to +1 (GF3(1))
-    pub fn verify_is_plus_one(&self) -> bool {
-        self.verify() && self.claimed_value == GF3::ONE
+        // Real branch announcement: A_x = h^k
+        let k = prng(seed) % ord + 1;
+        announcements[x as usize] = modpow(h, k, p);
+
+        // Fiat-Shamir global challenge
+        let global_c = challenge_hash(&[
+            commitment,
+            announcements[0],
+            announcements[1],
+            announcements[2],
+        ]);
+
+        // Split: c_x = global_c − Σ_{v≠x} e_v  (mod CHAL_MOD)
+        let sum_false: u64 = (0..3u64)
+            .filter(|&v| v != x)
+            .map(|v| challenges[v as usize])
+            .sum();
+        challenges[x as usize] =
+            (global_c + CHAL_MOD * 4 - sum_false % CHAL_MOD) % CHAL_MOD;
+        let c_x = challenges[x as usize];
+
+        // Real response: s_x = k + c_x · r  (mod ord)
+        responses[x as usize] = (k + c_x * r) % ord;
+
+        Self {
+            commitment,
+            announcements,
+            challenges,
+            responses,
+        }
     }
 }
+
+// ─── ZKVerifier ───────────────────────────────────────────────────────────────
+
+/// Verifies [`ZKProof`] transcripts produced by [`ZKProof::prove`].
+pub struct ZKVerifier {
+    pub params: PedersenParams,
+}
+
+impl ZKVerifier {
+    pub fn new(params: PedersenParams) -> Self {
+        Self { params }
+    }
+
+    /// Full verification:
+    ///  1. Commitment is in range (1..p).
+    ///  2. Challenges sum to recomputed Fiat-Shamir value (mod CHAL_MOD).
+    ///  3. Schnorr equation holds for every branch: h^{s_v} = A_v · T_v^{c_v}.
+    pub fn verify(&self, proof: &ZKProof) -> bool {
+        let (p, h, ord) = (self.params.p, self.params.h, self.params.p - 1);
+        let c = proof.commitment;
+
+        if c == 0 || c >= p {
+            return false;
+        }
+
+        let tv = |v: u64| -> u64 {
+            let g_neg_v = if v == 0 {
+                1u64
+            } else {
+                modpow(self.params.g, ord - v, p)
+            };
+            c * g_neg_v % p
+        };
+
+        // 1. Challenge sum
+        let global_c = challenge_hash(&[
+            c,
+            proof.announcements[0],
+            proof.announcements[1],
+            proof.announcements[2],
+        ]);
+        let sum_c = proof.challenges.iter().sum::<u64>() % CHAL_MOD;
+        if sum_c != global_c % CHAL_MOD {
+            return false;
+        }
+
+        // 2. Schnorr equation for each branch: h^{s_v} == A_v · T_v^{c_v}
+        for v in 0..3u64 {
+            let lhs = modpow(h, proof.responses[v as usize], p);
+            let rhs = proof.announcements[v as usize]
+                * modpow(tv(v), proof.challenges[v as usize], p)
+                % p;
+            if lhs != rhs {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Sanity check: commitment in range, at least one non-zero challenge.
+    pub fn check_structure(&self, proof: &ZKProof) -> bool {
+        proof.commitment > 0
+            && proof.commitment < self.params.p
+            && proof.challenges.iter().any(|&c| c > 0)
+    }
+
+    /// Verify a polynomial's GF(3) range and its SRS commitment in one call.
+    pub fn verify_poly_commitment(
+        &self,
+        pc: &PolynomialCommitment,
+        poly: &GF3Polynomial,
+        commitment: u64,
+    ) -> bool {
+        poly.coeffs.iter().all(|c| c.0 < 3) && pc.verify(poly, commitment)
+    }
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -- GF3 tests --
+    // ── TernaryField ──────────────────────────────────────────────────────────
 
     #[test]
-    fn test_gf3_add() {
-        assert_eq!(GF3(2).add(GF3(2)), GF3(1)); // 2+2=4≡1
-        assert_eq!(GF3(1).add(GF3(2)), GF3(0));
-        assert_eq!(GF3(0).add(GF3(1)), GF3(1));
+    fn test_field_add_wraps() {
+        // 2 + 1 = 3 ≡ 0;  1 + 1 = 2 ≡ −1
+        assert_eq!(TernaryField(2).add(TernaryField(1)), TernaryField::ZERO);
+        assert_eq!(TernaryField(1).add(TernaryField(1)), TernaryField::NEG_ONE);
     }
 
     #[test]
-    fn test_gf3_mul() {
-        assert_eq!(GF3(2).mul(GF3(2)), GF3(1)); // 2*2=4≡1
-        assert_eq!(GF3(2).mul(GF3(0)), GF3(0));
-        assert_eq!(GF3(1).mul(GF3(2)), GF3(2));
+    fn test_field_sub_wraps() {
+        assert_eq!(TernaryField::ZERO.sub(TernaryField::ONE), TernaryField::NEG_ONE);
+        assert_eq!(TernaryField::ONE.sub(TernaryField::NEG_ONE), TernaryField::NEG_ONE);
     }
 
     #[test]
-    fn test_gf3_inv() {
-        assert_eq!(GF3(1).inv(), Some(GF3(1)));
-        assert_eq!(GF3(2).inv(), Some(GF3(2)));
-        assert_eq!(GF3(0).inv(), None);
+    fn test_field_mul_table() {
+        assert_eq!(TernaryField::NEG_ONE.mul(TernaryField::NEG_ONE), TernaryField::ONE);
+        assert_eq!(TernaryField::ZERO.mul(TernaryField::ONE), TernaryField::ZERO);
+        assert_eq!(TernaryField::ONE.mul(TernaryField::NEG_ONE), TernaryField::NEG_ONE);
     }
 
     #[test]
-    fn test_gf3_trit_roundtrip() {
-        for t in [-1i8, 0, 1] {
-            assert_eq!(GF3::from_trit(t).to_trit(), t);
+    fn test_field_inv() {
+        assert_eq!(TernaryField::ONE.inv(), Some(TernaryField::ONE));
+        assert_eq!(TernaryField::NEG_ONE.inv(), Some(TernaryField::NEG_ONE));
+        assert_eq!(TernaryField::ZERO.inv(), None);
+    }
+
+    #[test]
+    fn test_field_neg_involution() {
+        for v in 0u8..3 {
+            let x = TernaryField(v);
+            assert_eq!(x.neg().neg(), x);
         }
     }
 
     #[test]
-    fn test_gf3_pow() {
-        // Fermat: a^3 = a in GF(3) (actually a^(3-1)=1 for nonzero)
-        assert_eq!(GF3(2).pow(2), GF3(1)); // 2^2=4≡1
-        assert_eq!(GF3(1).pow(100), GF3(1));
+    fn test_field_new_reduces() {
+        assert_eq!(TernaryField::new(-1), TernaryField::NEG_ONE);
+        assert_eq!(TernaryField::new(4), TernaryField::ONE);
+        assert_eq!(TernaryField::new(9), TernaryField::ZERO);
     }
 
-    // -- TernaryPoly tests --
+    // ── GF3Polynomial ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_poly_eval() {
-        // p(x) = 1 + 2x + x^2, eval at x=1: 1+2+1=4≡1
-        let p = TernaryPoly::new(vec![GF3(1), GF3(2), GF3(1)]);
-        assert_eq!(p.eval(GF3(1)), GF3(1));
-    }
-
-    #[test]
-    fn test_poly_mul_add() {
-        let a = TernaryPoly::new(vec![GF3(1), GF3(1)]); // 1+x
-        let b = TernaryPoly::new(vec![GF3(1), GF3(2)]); // 1+2x
-        let product = a.mul(&b); // (1+x)(1+2x) = 1+3x+2x^2 = 1+0x+2x^2 in GF(3)
-        assert_eq!(product.get(0), GF3(1));
-        assert_eq!(product.get(1), GF3(0));
-        assert_eq!(product.get(2), GF3(2));
+    fn test_poly_evaluate_constant() {
+        let p = GF3Polynomial::constant(TernaryField::ONE);
+        for v in 0u8..3 {
+            assert_eq!(p.evaluate(TernaryField(v)), TernaryField::ONE);
+        }
     }
 
     #[test]
-    fn test_poly_rem() {
-        // x^2 mod (x^2+1) = x^2 - (x^2+1) = -1 ≡ 2 in GF(3)
-        let p = TernaryPoly::new(vec![GF3(0), GF3(0), GF3(1)]); // x^2
-        let m = GF3n::gf9_modulus(); // x^2+1
-        let r = p.rem(&m);
-        // x^2 = (x^2+1) - 1 ≡ -1 ≡ 2 mod (x^2+1)
-        assert_eq!(r.get(0), GF3(2));
-        assert_eq!(r.degree(), Some(0));
-    }
-
-    // -- GF(3^2) tests --
-
-    #[test]
-    fn test_gf9_add() {
-        let m = GF3n::gf9_modulus();
-        let a = GF3n::new(TernaryPoly::new(vec![GF3(1), GF3(2)]), m.clone(), 2);
-        let b = GF3n::new(TernaryPoly::new(vec![GF3(2), GF3(1)]), m.clone(), 2);
-        let c = a.add(&b);
-        assert_eq!(c.poly.get(0), GF3(0));
-        assert_eq!(c.poly.get(1), GF3(0));
+    fn test_poly_evaluate_linear() {
+        // f(x) = x: f(0)=0, f(1)=1, f(2)=2≡−1
+        let f = GF3Polynomial::new(vec![TernaryField::ZERO, TernaryField::ONE]);
+        assert_eq!(f.evaluate(TernaryField(0)), TernaryField::ZERO);
+        assert_eq!(f.evaluate(TernaryField(1)), TernaryField::ONE);
+        assert_eq!(f.evaluate(TernaryField(2)), TernaryField::NEG_ONE);
     }
 
     #[test]
-    fn test_gf9_mul_by_one() {
-        let m = GF3n::gf9_modulus();
-        let a = GF3n::new(TernaryPoly::new(vec![GF3(2), GF3(1)]), m.clone(), 2);
-        let one = GF3n::one(m.clone(), 2);
-        let result = a.mul(&one);
-        assert_eq!(result.poly, a.poly);
-    }
-
-    // -- Commitment tests --
-
-    #[test]
-    fn test_commitment_binding() {
-        let c = Commitment::commit(GF3(1), 42);
-        assert!(c.verify_opening(GF3(1), 42));
-        assert!(!c.verify_opening(GF3(2), 42));
-        assert!(!c.verify_opening(GF3(1), 43));
+    fn test_poly_add_sub_roundtrip() {
+        let f = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::NEG_ONE]);
+        let g = GF3Polynomial::new(vec![TernaryField::NEG_ONE, TernaryField::ONE]);
+        assert_eq!(f.add(&g).sub(&g), f);
     }
 
     #[test]
-    fn test_commitment_hiding() {
-        // Different values → different commitments (probabilistically)
-        let c0 = Commitment::commit(GF3(0), 1234);
-        let c1 = Commitment::commit(GF3(1), 1234);
-        let c2 = Commitment::commit(GF3(2), 1234);
-        assert_ne!(c0.hash, c1.hash);
-        assert_ne!(c1.hash, c2.hash);
-    }
-
-    // -- Polynomial commitment tests --
-
-    #[test]
-    fn test_poly_commitment_eval_proof() {
-        let p = TernaryPoly::new(vec![GF3(1), GF3(2), GF3(0), GF3(1)]); // 1 + 2x + x^3
-        let nonces = vec![11u64, 22, 33, 44];
-        let pc = PolyCommitment::commit(&p, nonces);
-        let proof = pc.open_eval(&p, GF3(2));
-        assert!(proof.verify(&pc));
+    fn test_poly_mul_degree() {
+        // x · (x+1) has degree 2
+        let x = GF3Polynomial::new(vec![TernaryField::ZERO, TernaryField::ONE]);
+        let x1 = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::ONE]);
+        assert_eq!(x.mul(&x1).degree(), Some(2));
     }
 
     #[test]
-    fn test_poly_commitment_wrong_value_fails() {
-        let p = TernaryPoly::new(vec![GF3(1), GF3(1)]);
-        let nonces = vec![7u64, 13];
-        let pc = PolyCommitment::commit(&p, nonces.clone());
-        let mut proof = pc.open_eval(&p, GF3(1));
-        // Tamper with claimed value
-        proof.claimed_value = GF3(0);
-        assert!(!proof.verify(&pc));
+    fn test_ternary_membership_poly_vanishes() {
+        // x³ − x must be 0 for all x ∈ GF(3)
+        let p = GF3Polynomial::ternary_membership_poly();
+        for v in 0u8..3 {
+            assert_eq!(
+                p.evaluate(TernaryField(v)),
+                TernaryField::ZERO,
+                "x³−x should vanish at {}",
+                v
+            );
+        }
     }
 
-    // -- ZKProof tests --
+    // ── PolynomialCommitment ───────────────────────────────────────────────────
 
     #[test]
-    fn test_zkproof_verify_plus_one() {
-        let (_, proof) = ZKProof::prove_is_plus_one(GF3(1), 9999).unwrap();
-        assert!(proof.verify_is_plus_one());
+    fn test_pc_commit_verify_roundtrip() {
+        let pc = PolynomialCommitment::setup(7, 4);
+        let f = GF3Polynomial::new(vec![
+            TernaryField::ONE,
+            TernaryField::NEG_ONE,
+            TernaryField::ONE,
+        ]);
+        let c = pc.commit(&f);
+        assert!(pc.verify(&f, c));
     }
 
     #[test]
-    fn test_zkproof_returns_none_for_non_plus_one() {
-        assert!(ZKProof::prove_is_plus_one(GF3(0), 1).is_none());
-        assert!(ZKProof::prove_is_plus_one(GF3(2), 1).is_none());
+    fn test_pc_different_polys_differ() {
+        let pc = PolynomialCommitment::setup(13, 4);
+        let f = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::NEG_ONE]);
+        let g = GF3Polynomial::new(vec![TernaryField::NEG_ONE, TernaryField::ONE]);
+        assert_ne!(pc.commit(&f), pc.commit(&g));
+    }
+
+    // ── ZKProof / ZKVerifier ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_zkp_verifies_x0() {
+        let params = PedersenParams::default();
+        let proof = ZKProof::prove(&params, 0, 42, 1);
+        assert!(ZKVerifier::new(params).verify(&proof));
     }
 
     #[test]
-    fn test_zkproof_commitment_matches() {
-        let (commitment, proof) = ZKProof::prove_is_plus_one(GF3(1), 42).unwrap();
-        assert_eq!(commitment, proof.commitment);
+    fn test_zkp_verifies_x1() {
+        let params = PedersenParams::default();
+        let proof = ZKProof::prove(&params, 1, 100, 999);
+        assert!(ZKVerifier::new(params).verify(&proof));
+    }
+
+    #[test]
+    fn test_zkp_verifies_x2() {
+        let params = PedersenParams::default();
+        let proof = ZKProof::prove(&params, 2, 77, 12345);
+        assert!(ZKVerifier::new(params).verify(&proof));
+    }
+
+    #[test]
+    fn test_zkp_tampered_challenge_fails() {
+        let params = PedersenParams::default();
+        let mut proof = ZKProof::prove(&params, 1, 50, 7);
+        proof.challenges[0] = proof.challenges[0].wrapping_add(1);
+        assert!(!ZKVerifier::new(params).verify(&proof));
+    }
+
+    #[test]
+    fn test_zkp_tampered_response_fails() {
+        let params = PedersenParams::default();
+        let mut proof = ZKProof::prove(&params, 0, 33, 3);
+        proof.responses[0] = proof.responses[0].wrapping_add(1) % (P - 1);
+        assert!(!ZKVerifier::new(params).verify(&proof));
+    }
+
+    #[test]
+    fn test_zkp_check_structure() {
+        let params = PedersenParams::default();
+        let proof = ZKProof::prove(&params, 2, 88, 404);
+        assert!(ZKVerifier::new(params.clone()).check_structure(&proof));
+    }
+
+    #[test]
+    fn test_verify_poly_commitment() {
+        let params = PedersenParams::default();
+        let v = ZKVerifier::new(params);
+        let pc = PolynomialCommitment::setup(11, 3);
+        let poly = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::NEG_ONE]);
+        let c = pc.commit(&poly);
+        assert!(v.verify_poly_commitment(&pc, &poly, c));
     }
 }
