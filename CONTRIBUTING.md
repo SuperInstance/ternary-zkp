@@ -1,47 +1,26 @@
-# Contributing — ternary-zkp
+# Contributing
 
-> *Thank you for contributing to the SuperInstance fleet.*
+Thank you for your interest! This project is part of the [SuperInstance](https://github.com/SuperInstance) ecosystem.
 
-## How to Contribute
+## Quick Start
 
-### 1. Understand the Ternary Ethos
+1. Fork the repository
+2. Create a feature branch: `git checkout -b my-feature`
+3. Make your changes
+4. Run tests: `cargo test`
+5. Submit a pull request
 
-We use {-1, 0, +1} because it is the minimum viable alphabet for expressing agreement,
-disagreement, and abstention. **0 is not "nothing"** — it is a deliberate neutral state.
+## Guidelines
 
-### 2. Set Up
+- Follow `cargo fmt` and `cargo clippy`
+- All new features need tests
+- Public APIs need doc comments
+- Squash related commits
 
-```bash
-git clone https://github.com/SuperInstance/ternary-zkp.git
-cd ternary-zkp
-cargo build
-cargo test
-```
+## Code of Conduct
 
-### 3. Code Standards
-
-- **No unsafe code** unless absolutely necessary
-- **Ternary-compatible** — prefer {-1, 0, +1} where appropriate
-- **Test coverage** — every public function needs tests
-- **Documentation** — all public items must have doc comments
-
-### 4. Commit Messages
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-feat: add ternary quantization
-fix: handle zero-input edge case
-docs: update architecture
-```
-
-### 5. Pull Request Process
-
-1. Fork and feature branch
-2. Write tests
-3. All tests pass: `cargo test`
-4. Submit PR with clear description
+Be respectful, be constructive.
 
 ## License
 
-By contributing, you agree your contributions will be MIT OR Apache-2.0.
+By contributing, you agree your work is dual-licensed under MIT OR Apache-2.0.
