@@ -26,8 +26,18 @@ pub fn modpow(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
     result
 }
 
-/// Modular inverse via Fermat's little theorem (prime modulus required).
+/// Modular inverse via Fermat's little theorem (`p` must be prime).
+///
+/// # Panics
+///
+/// Panics if `a` is not invertible modulo `p` (`a % p == 0`) or if `p < 2`
+/// (Fermat requires a prime modulus). Previously `modinv(0, p)` returned `0`
+/// silently — a wrong answer, since 0 has no inverse — which could corrupt any
+/// computation using the result as an inverse.
 pub fn modinv(a: u64, p: u64) -> u64 {
+    assert!(p >= 2, "modinv requires a prime modulus p >= 2");
+    let a = a % p;
+    assert!(a != 0, "{a} has no multiplicative inverse mod {p}");
     modpow(a, p - 2, p)
 }
 
@@ -547,6 +557,26 @@ mod tests {
         assert_eq!(TernaryField::new(-1), TernaryField::NEG_ONE);
         assert_eq!(TernaryField::new(4), TernaryField::ONE);
         assert_eq!(TernaryField::new(9), TernaryField::ZERO);
+    }
+
+    #[test]
+    fn test_modinv_correctness() {
+        // 3 · 333_333_336 = 1_000_000_008 ≡ 1 (mod 10^9+7).
+        assert_eq!(modinv(3, P), 333_333_336);
+        assert_eq!(modinv(7, P) * 7 % P, 1);
+        // a >= p is reduced first.
+        assert_eq!(modinv(3 + P, P), modinv(3, P));
+    }
+
+    #[test]
+    fn test_modinv_zero_is_not_invertible() {
+        // Previously modinv(0, p) returned 0 (a wrong answer: 0 has no inverse).
+        // It must now panic instead of silently returning garbage.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modinv(0, P)));
+        assert!(r.is_err(), "modinv(0, p) must panic");
+        // A multiple of p is likewise non-invertible.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modinv(2 * P, P)));
+        assert!(r.is_err(), "modinv(2p, p) must panic");
     }
 
     // ── GF3Polynomial ─────────────────────────────────────────────────────────
