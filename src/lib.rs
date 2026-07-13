@@ -1,11 +1,11 @@
 //! Zero-knowledge proofs over the ternary field GF(3).
 //!
-//! - [`TernaryField`]        GF(3) arithmetic; elements {0,1,2}, where 2 ≡ −1
-//! - [`GF3Polynomial`]       dense polynomials over GF(3)
-//! - [`PolynomialCommitment`] SRS-based commit: C(f) = g^{f(τ)} mod p
-//! - [`ZKProof`]             CDS94 OR-proof that a Pedersen commitment hides
-//!                           some x ∈ {0,1,2} without revealing which
-//! - [`ZKVerifier`]          verifies ZKProof transcripts
+//! - [`TernaryField`]: GF(3) arithmetic; elements {0,1,2}, where 2 ≡ −1
+//! - [`GF3Polynomial`]: dense polynomials over GF(3)
+//! - [`PolynomialCommitment`]: SRS-based commit: C(f) = g^{f(τ)} mod p
+//! - [`ZKProof`]: CDS94 OR-proof that a Pedersen commitment hides some
+//!   x ∈ {0,1,2} without revealing which
+//! - [`ZKVerifier`]: verifies ZKProof transcripts
 
 // ─── modular arithmetic ───────────────────────────────────────────────────────
 
@@ -67,18 +67,24 @@ impl TernaryField {
 
     /// Construct from any integer, canonically reducing mod 3.
     pub fn new(v: i64) -> Self {
-        Self(((v % 3 + 3) % 3) as u8)
+        Self(v.rem_euclid(3) as u8)
     }
 
+    // The inherent methods below are the documented field-operation API for this
+    // educational crate; intentionally named after the operations they perform.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, rhs: Self) -> Self {
         Self((self.0 + rhs.0) % 3)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, rhs: Self) -> Self {
         Self((self.0 + 3 - rhs.0) % 3)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Self) -> Self {
         Self(self.0 * rhs.0 % 3)
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn neg(self) -> Self {
         Self((3 - self.0) % 3)
     }
@@ -329,8 +335,7 @@ impl ZKProof {
             challenges[v as usize] = e_v;
             responses[v as usize] = s_v;
             // A_v = h^{s_v} · T_v^{−e_v}
-            announcements[v as usize] =
-                modpow(h, s_v, p) * modpow(modinv(tv(v), p), e_v, p) % p;
+            announcements[v as usize] = modpow(h, s_v, p) * modpow(modinv(tv(v), p), e_v, p) % p;
         }
 
         // Real branch announcement: A_x = h^k
@@ -350,8 +355,7 @@ impl ZKProof {
             .filter(|&v| v != x)
             .map(|v| challenges[v as usize])
             .sum();
-        challenges[x as usize] =
-            (global_c + CHAL_MOD * 4 - sum_false % CHAL_MOD) % CHAL_MOD;
+        challenges[x as usize] = (global_c + CHAL_MOD * 4 - sum_false % CHAL_MOD) % CHAL_MOD;
         let c_x = challenges[x as usize];
 
         // Real response: s_x = k + c_x · r  (mod ord)
@@ -460,15 +464,30 @@ mod tests {
 
     #[test]
     fn test_field_sub_wraps() {
-        assert_eq!(TernaryField::ZERO.sub(TernaryField::ONE), TernaryField::NEG_ONE);
-        assert_eq!(TernaryField::ONE.sub(TernaryField::NEG_ONE), TernaryField::NEG_ONE);
+        assert_eq!(
+            TernaryField::ZERO.sub(TernaryField::ONE),
+            TernaryField::NEG_ONE
+        );
+        assert_eq!(
+            TernaryField::ONE.sub(TernaryField::NEG_ONE),
+            TernaryField::NEG_ONE
+        );
     }
 
     #[test]
     fn test_field_mul_table() {
-        assert_eq!(TernaryField::NEG_ONE.mul(TernaryField::NEG_ONE), TernaryField::ONE);
-        assert_eq!(TernaryField::ZERO.mul(TernaryField::ONE), TernaryField::ZERO);
-        assert_eq!(TernaryField::ONE.mul(TernaryField::NEG_ONE), TernaryField::NEG_ONE);
+        assert_eq!(
+            TernaryField::NEG_ONE.mul(TernaryField::NEG_ONE),
+            TernaryField::ONE
+        );
+        assert_eq!(
+            TernaryField::ZERO.mul(TernaryField::ONE),
+            TernaryField::ZERO
+        );
+        assert_eq!(
+            TernaryField::ONE.mul(TernaryField::NEG_ONE),
+            TernaryField::NEG_ONE
+        );
     }
 
     #[test]
