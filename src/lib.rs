@@ -243,12 +243,25 @@ impl PolynomialCommitment {
         Self { srs }
     }
 
+    /// Commit to `poly`, returning `G^{f(τ)} mod P`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poly` has degree `>= srs.len()` — i.e. it exceeds the
+    /// `max_degree` handed to [`setup`](Self::setup). The SRS lacks the powers
+    /// of τ needed to commit such a polynomial; silently dropping the
+    /// out-of-range coefficients would make two distinct polynomials commit to
+    /// the same value, breaking binding. Size `setup` to your largest polynomial.
     pub fn commit(&self, poly: &GF3Polynomial) -> u64 {
+        assert!(
+            poly.coeffs.len() <= self.srs.len(),
+            "polynomial degree {} exceeds SRS capacity (max_degree {}); \
+             cannot commit without breaking binding",
+            poly.coeffs.len().saturating_sub(1),
+            self.srs.len() - 1
+        );
         let mut c = 1u64;
         for (i, &coeff) in poly.coeffs.iter().enumerate() {
-            if i >= self.srs.len() {
-                break;
-            }
             c = c * modpow(self.srs[i], coeff.0 as u64, P) % P;
         }
         c
@@ -584,6 +597,26 @@ mod tests {
         let f = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::NEG_ONE]);
         let g = GF3Polynomial::new(vec![TernaryField::NEG_ONE, TernaryField::ONE]);
         assert_ne!(pc.commit(&f), pc.commit(&g));
+    }
+
+    #[test]
+    fn test_pc_oversized_poly_is_rejected() {
+        // Binding: previously commit() silently dropped coefficients beyond the
+        // SRS size, so [1,0] and [1,0,1] committed identically. Now an oversized
+        // polynomial must be rejected loudly instead of producing a colliding
+        // commitment.
+        let pc = PolynomialCommitment::setup(7, 1); // srs supports degree <= 1
+        let ok = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::ZERO]);
+        let too_big = GF3Polynomial::new(vec![
+            TernaryField::ONE,
+            TernaryField::ZERO,
+            TernaryField::ONE,
+        ]);
+        // In-range polynomial commits fine.
+        let _ = pc.commit(&ok);
+        // Out-of-range polynomial must panic (binding would otherwise break).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pc.commit(&too_big)));
+        assert!(result.is_err(), "oversized polynomial must be rejected");
     }
 
     // ── ZKProof / ZKVerifier ──────────────────────────────────────────────────
