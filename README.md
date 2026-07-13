@@ -145,7 +145,7 @@ cargo run --example demo
 
 ## Running the Tests
 
-The crate contains **20 tests**.  Each test isolates a single cryptographic invariant:
+The crate contains **25 tests**.  Each test isolates a single cryptographic invariant:
 
 ### Field arithmetic
 
@@ -174,6 +174,7 @@ The crate contains **20 tests**.  Each test isolates a single cryptographic inva
 |------|----------------|
 | `test_pc_commit_verify_roundtrip` | A committed polynomial verifies against its SRS commitment. |
 | `test_pc_different_polys_differ` | Distinct polynomials produce distinct commitments. |
+| `test_pc_oversized_poly_is_rejected` | A polynomial exceeding the SRS size is rejected (binding preserved). |
 | `test_verify_poly_commitment` | Combines coefficient-range checks with SRS verification. |
 
 ### Zero-knowledge proofs
@@ -186,6 +187,10 @@ The crate contains **20 tests**.  Each test isolates a single cryptographic inva
 | `test_zkp_tampered_challenge_fails` | Modifying any challenge breaks the Fiat–Shamir sum check. |
 | `test_zkp_tampered_response_fails` | Modifying any response breaks the Schnorr equation. |
 | `test_zkp_check_structure` | Basic structural sanity checks pass on a valid proof. |
+| `test_zkp_large_randomness_no_overflow` | Completeness holds for randomness near `u64::MAX` (no overflow). |
+| `test_zkp_completeness_independent_recheck` | Re-derives every verifier equation inline, independent of `verify`. |
+| `test_zkp_rejects_fully_simulated_forgery` | A no-witness all-simulated forgery is rejected (soundness). |
+| `test_security_nonce_reuse_leaks_secret` | ⚠️ Documents the nonce-reuse secret leak (vulnerability demo). |
 
 Execute:
 
