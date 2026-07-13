@@ -44,6 +44,15 @@ pub fn challenge_hash(values: &[u64]) -> u64 {
     (h >> 8) % (1 << 20) + 1
 }
 
+/// ⚠️ **NOT cryptographically secure.**
+///
+/// This is a plain linear-congruential generator used only for the
+/// educational, non-interactive proof transcript. It must NEVER seed real
+/// nonces, challenges, or blinding factors in a security-critical setting: an
+/// LCG is predictable, and deriving the real-branch Schnorr nonce from it means
+/// reusing a `nonce` value leaks the secret `r` (see
+/// `test_security_nonce_reuse_leaks_secret`). Production code must draw all
+/// randomness from a CSPRNG.
 fn prng(seed: u64) -> u64 {
     seed.wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407)
@@ -315,7 +324,18 @@ pub struct ZKProof {
 impl ZKProof {
     /// Prove that `x ∈ {0,1,2}` is committed in C = g^x · h^r.
     ///
-    /// `nonce` is deterministic randomness; use fresh secure entropy in production.
+    /// `nonce` seeds the (non-cryptographic) transcript randomness.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// This is educational code. The real-branch Schnorr nonce `k` and all
+    /// simulated challenges/responses are derived deterministically from
+    /// `nonce` via a weak LCG (see [`prng`]). For a given `nonce` the nonce `k`
+    /// is identical regardless of `x`, so reusing one `nonce` across two proofs
+    /// for the same secret `r` **leaks `r`** (classic Schnorr nonce reuse — see
+    /// `test_security_nonce_reuse_leaks_secret`). Do not use this for anything
+    /// security-critical; a production version must draw nonces from a CSPRNG
+    /// and never reuse them.
     pub fn prove(params: &PedersenParams, x: u64, r: u64, nonce: u64) -> Self {
         assert!(x < 3, "x must be in {{0,1,2}}");
         let (p, h, ord) = (params.p, params.h, params.p - 1);
@@ -799,5 +819,54 @@ mod tests {
             !ZKVerifier::new(params).verify(&forged),
             "fully-simulated forgery must be rejected"
         );
+    }
+
+    // ── SECURITY: documented vulnerability demonstration ────────────────────
+    //
+    // ⚠️  This test demonstrates a KNOWN, OUT-OF-SCOPE vulnerability, NOT
+    // correct behaviour. The proof's randomness is a deterministic,
+    // cryptographically-weak LCG seeded solely by `nonce`. Reusing one nonce
+    // value across two proofs for the same secret `r` reuses the real-branch
+    // Schnorr nonce k, which leaks `r` in the standard way. A production
+    // implementation MUST draw nonces from a CSPRNG and never reuse them.
+    #[test]
+    fn test_security_nonce_reuse_leaks_secret() {
+        // Extended-Euclid inverse (ord = p-1 is composite, so the crate's
+        // Fermat-based `modinv`, which requires a prime modulus, cannot be used).
+        fn egcd_inv(a: i128, m: i128) -> i128 {
+            let (mut old_r, mut r) = (a.rem_euclid(m), m);
+            let (mut old_s, mut s) = (1i128, 0i128);
+            while r != 0 {
+                let q = old_r / r;
+                (old_r, r) = (r, old_r - q * r);
+                (old_s, s) = (s, old_s - q * s);
+            }
+            old_s.rem_euclid(m)
+        }
+
+        let params = PedersenParams::default();
+        let ord = (params.p - 1) as i128;
+        let secret_r = 99_981u64; // chosen < p-1
+        let nonce = 12345u64;
+
+        // Two valid proofs for the SAME secret_r, DIFFERENT x, SAME nonce.
+        let proof0 = ZKProof::prove(&params, 0, secret_r, nonce); // real branch = 0
+        let proof1 = ZKProof::prove(&params, 1, secret_r, nonce); // real branch = 1
+        assert!(ZKVerifier::new(params.clone()).verify(&proof0));
+        assert!(ZKVerifier::new(params.clone()).verify(&proof1));
+
+        // Both real branches use the identical nonce k, so
+        //   s0 = k + c0·r ,  s1 = k + c1·r   (mod ord)
+        // ⇒  r = (s0 − s1) · (c0 − c1)⁻¹   (mod ord).
+        let c0 = proof0.challenges[0] as i128;
+        let s0 = proof0.responses[0] as i128;
+        let c1 = proof1.challenges[1] as i128;
+        let s1 = proof1.responses[1] as i128;
+        let num = (s0 - s1).rem_euclid(ord);
+        let den = (c0 - c1).rem_euclid(ord);
+        let recovered = (num * egcd_inv(den, ord)).rem_euclid(ord) as u64;
+
+        // The secret is fully recovered from the two public transcripts.
+        assert_eq!(recovered, secret_r, "nonce reuse must leak r (vuln demo)");
     }
 }
