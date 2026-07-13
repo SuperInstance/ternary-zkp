@@ -358,8 +358,12 @@ impl ZKProof {
         challenges[x as usize] = (global_c + CHAL_MOD * 4 - sum_false % CHAL_MOD) % CHAL_MOD;
         let c_x = challenges[x as usize];
 
-        // Real response: s_x = k + c_x · r  (mod ord)
-        responses[x as usize] = (k + c_x * r) % ord;
+        // Real response: s_x = k + c_x · r  (mod ord).
+        // r is reduced mod ord first: s_x ≡ k + c_x·r (mod ord) because h has
+        // order dividing ord, and it keeps the product (c_x < 2^20) · (r%ord
+        // < 2^30) well within u64, avoiding an overflow that would otherwise
+        // panic in debug / silently corrupt s_x in release.
+        responses[x as usize] = (k + c_x * (r % ord)) % ord;
 
         Self {
             commitment,
@@ -636,5 +640,23 @@ mod tests {
         let poly = GF3Polynomial::new(vec![TernaryField::ONE, TernaryField::NEG_ONE]);
         let c = pc.commit(&poly);
         assert!(v.verify_poly_commitment(&pc, &poly, c));
+    }
+
+    #[test]
+    fn test_zkp_large_randomness_no_overflow() {
+        // Regression: the real-branch response s_x = (k + c_x * r) % ord must
+        // not overflow u64 for large r. Previously `c_x * r` overflowed in
+        // debug (panic) and wrapped in release, making an honest proof fail
+        // verification. Completeness must hold across the full randomness range.
+        let params = PedersenParams::default();
+        for &r in &[u64::MAX, 9_223_372_036_854_775_000, 1u64 << 50] {
+            for x in 0u64..3 {
+                let proof = ZKProof::prove(&params, x, r, x.wrapping_add(1));
+                assert!(
+                    ZKVerifier::new(params.clone()).verify(&proof),
+                    "completeness failed for x={x}, r={r}"
+                );
+            }
+        }
     }
 }
