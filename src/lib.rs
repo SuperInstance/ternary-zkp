@@ -692,4 +692,112 @@ mod tests {
             }
         }
     }
+
+    // ── cryptographic property verification ─────────────────────────────────
+    //
+    // Completeness, hand-derived:
+    //   C = g^x · h^r;  T_v = C·g^{-v};  when v == x, T_x = g^{x-x}·h^r = h^r.
+    //   False branch:  A_v = h^{s_v}·T_v^{-e_v}  ⇒  h^{s_v} = A_v·T_v^{e_v}. ✓
+    //   Real branch:   A_x = h^k, s_x = k + c_x·r (mod ord), T_x = h^r
+    //                  ⇒ A_x·T_x^{c_x} = h^k·h^{r·c_x} = h^{k+c_x·r} = h^{s_x}. ✓
+    //   Challenge sum: c_x ≡ global_c − Σ_{v≠x} e_v  (mod 2^20). ✓
+    // The test below re-derives every verifier equation inline, independent of
+    // ZKVerifier::verify, for all three values of x.
+    #[test]
+    fn test_zkp_completeness_independent_recheck() {
+        let params = PedersenParams::default();
+        let (g, h, p) = (params.g, params.h, params.p);
+        let ord = p - 1;
+
+        for x in 0u64..3 {
+            for r in [7u64, 100, 4242] {
+                let proof = ZKProof::prove(&params, x, r, 1 + x * 100 + r % 17);
+                let c = proof.commitment;
+
+                // Sanity: the commitment really is g^x · h^r.
+                assert_eq!(c, modpow(g, x, p) * modpow(h, r, p) % p);
+
+                // Independently recompute T_v = C·g^{-v}  (g^{-v} = g^{ord-v}).
+                let tv = |v: u64| -> u64 {
+                    let g_neg_v = if v == 0 { 1 } else { modpow(g, ord - v, p) };
+                    c * g_neg_v % p
+                };
+
+                // (1) Challenge sum: Σ e_v ≡ Hash(C, A_0, A_1, A_2) (mod 2^20).
+                let global_c = challenge_hash(&[
+                    c,
+                    proof.announcements[0],
+                    proof.announcements[1],
+                    proof.announcements[2],
+                ]);
+                let sum = proof.challenges.iter().sum::<u64>() % CHAL_MOD;
+                assert_eq!(sum, global_c % CHAL_MOD, "challenge sum mismatch");
+
+                // (2) Schnorr equation per branch: h^{s_v} ≡ A_v·T_v^{e_v} (mod p).
+                for v in 0u64..3 {
+                    let lhs = modpow(h, proof.responses[v as usize], p);
+                    let rhs = proof.announcements[v as usize]
+                        * modpow(tv(v), proof.challenges[v as usize], p)
+                        % p;
+                    assert_eq!(lhs, rhs, "Schnorr eq failed for x={x}, branch {v}");
+                }
+            }
+        }
+    }
+
+    // Soundness: a cheater with NO valid witness tries to forge a proof by
+    // fully simulating all three branches (pick e_v, s_v, set A_v = h^{s_v}·
+    // T_v^{-e_v}). Every Schnorr equation then holds by construction, but the
+    // challenge sum cannot match the Fiat–Shamir hash, so the full verifier
+    // must reject it. This is the exact scenario the challenge-sum check exists
+    // to catch.
+    #[test]
+    fn test_zkp_rejects_fully_simulated_forgery() {
+        let params = PedersenParams::default();
+        let (g, h, p) = (params.g, params.h, params.p);
+        let ord = p - 1;
+
+        // A commitment that genuinely hides a ternary value (so the verifier is
+        // not rejecting on a malformed commitment, but on the forged transcript).
+        let (x, r) = (1u64, 12345u64);
+        let c = modpow(g, x, p) * modpow(h, r, p) % p;
+        let tv = |v: u64| -> u64 {
+            let g_neg_v = if v == 0 { 1 } else { modpow(g, ord - v, p) };
+            c * g_neg_v % p
+        };
+
+        // Cheater simulates ALL branches with independent (deterministic) choices.
+        let mut announcements = [0u64; 3];
+        let mut challenges = [0u64; 3];
+        let mut responses = [0u64; 3];
+        let mut seed = 0xA11CE_u64;
+        for v in 0u64..3 {
+            let e = prng(seed) % CHAL_MOD + 1;
+            seed = prng(seed);
+            let s = prng(seed) % ord + 1;
+            seed = prng(seed);
+            challenges[v as usize] = e;
+            responses[v as usize] = s;
+            announcements[v as usize] = modpow(h, s, p) * modpow(modinv(tv(v), p), e, p) % p;
+        }
+
+        let forged = ZKProof {
+            commitment: c,
+            announcements,
+            challenges,
+            responses,
+        };
+
+        // First confirm the per-branch equations all hold (forge is "internally
+        // consistent"), then confirm the verifier still rejects via the sum.
+        for v in 0u64..3 {
+            let lhs = modpow(h, responses[v as usize], p);
+            let rhs = announcements[v as usize] * modpow(tv(v), challenges[v as usize], p) % p;
+            assert_eq!(lhs, rhs, "simulated branch {v} must satisfy its Schnorr eq");
+        }
+        assert!(
+            !ZKVerifier::new(params).verify(&forged),
+            "fully-simulated forgery must be rejected"
+        );
+    }
 }
